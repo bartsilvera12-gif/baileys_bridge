@@ -11,17 +11,43 @@ veces.
 
 ## Qué hace
 
-Sostiene la sesión de WhatsApp de **un** número, como WhatsApp Web, y hace de
-intermediario con el ERP:
+Sostiene las sesiones de WhatsApp —**una o varias**, como WhatsApp Web— y hace
+de intermediario con el ERP:
 
 - vincula el número por QR y lo reconecta solo cuando se cae;
 - cuando entra un mensaje, se lo avisa al ERP y le sube el archivo si lo tiene;
 - cuando el ERP quiere responder, manda el texto, el archivo o la reacción;
 - avisa cuando un mensaje saliente se entregó o se leyó.
 
-**Un número = un contenedor = un volumen.** La sesión vive en `AUTH_DIR`, y dos
-procesos sobre la misma carpeta se desconectan entre sí. Para un segundo número
-se despliega este mismo repo otra vez, con su propio volumen.
+## Varios números en un solo contenedor
+
+Lo que no se puede compartir entre dos números es la **carpeta** de la sesión,
+no el proceso. Así que acá hay una carpeta por número dentro de `AUTH_DIR` y
+una ruta por número:
+
+```
+https://wa.midominio.com/s/<CHANNEL_ID>/status
+https://wa.midominio.com/s/<CHANNEL_ID>/send
+```
+
+El ERP no necesita saber nada de esto: guarda la URL del puente por canal y le
+pega `/status`, `/send`, etc. Poniéndole `https://wa.midominio.com/s/<CHANNEL_ID>`
+sale solo.
+
+Y la sesión **se crea sola** la primera vez que el ERP pregunta por ese canal.
+Agregar un número más es: crear el canal en el ERP, pegar esa URL, escanear.
+Sin deploy, sin subdominio nuevo, sin volumen nuevo.
+
+Las rutas sin el prefijo `/s/<id>` siguen funcionando contra `CHANNEL_ID`, para
+los puentes de un solo número que ya estaban configurados así. Y si encuentra
+credenciales sueltas en la raíz de `AUTH_DIR` (el formato viejo), las muda a la
+carpeta de `CHANNEL_ID` al arrancar: el número que ya estaba vinculado sigue
+vinculado.
+
+**Lo que se comparte, se comparte de verdad:** los números viven en el mismo
+proceso. Si el contenedor se reinicia, se reconectan todos a la vez (solos,
+desde las credenciales guardadas), y la memoria es la suma de todas las
+sesiones. Con muchos números conviene mirar cuánta RAM tiene el servidor.
 
 ## Variables
 
@@ -30,7 +56,8 @@ se despliega este mismo repo otra vez, con su propio volumen.
 | `BRIDGE_SECRET` | sí | Secreto compartido con el ERP. Allá se llama `BAILEYS_BRIDGE_SECRET` y tiene que ser **el mismo valor**. Uno distinto por cliente. |
 | `ERP_BASE_URL` | sí | La base del ERP, ej. `https://roldanehijos.neura.com.py`. Sin la ruta. |
 | `EMPRESA_ID` | sí | El `empresa_id` del cliente en el ERP. |
-| `CHANNEL_ID` | sí | El id del canal. Lo da la pantalla de alta del canal en el ERP, así que se carga **después** de crearlo. |
+| `CHANNEL_ID` | no | Solo para el modo de un número: el canal al que responden las rutas sin `/s/<id>`. Con varios números no hace falta. |
+| `MAX_SESIONES` | no | Tope de números en este contenedor. 10 por defecto. |
 | `AUTH_DIR` | recomendada | Dónde vive la sesión. En Coolify, `/app/auth` sobre un volumen persistente: sin volumen hay que escanear el QR en cada deploy. |
 | `PORT` | no | 3000 por defecto. |
 | `KIND_VOCAB` | no | `baileys` (por defecto) o `simple`. Ver abajo. |

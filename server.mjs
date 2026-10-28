@@ -1,33 +1,42 @@
 // =============================================================================
 // Puente de WhatsApp por QR (Baileys) para los ERP de Neura.
 //
-// UN SOLO REPO PARA TODOS LOS CLIENTES. Nada acá es específico de una empresa:
-// todo lo que cambia entre clientes son variables de entorno. Antes había un
-// repo copiado por cliente y un arreglo había que aplicarlo N veces.
+// UN CONTENEDOR, VARIOS NÚMEROS. Lo que no se puede compartir entre dos
+// números es la CARPETA de la sesión, no el proceso. Así que acá vive una
+// carpeta por número dentro de AUTH_DIR y una ruta por número:
 //
-// Sostiene la sesión de WhatsApp de UN número (como WhatsApp Web) y hace de
-// intermediario con el ERP. Un número = un contenedor = un volumen: la sesión
-// vive en AUTH_DIR y dos procesos sobre la misma carpeta se desconectan entre
-// sí.
+//     /s/<CHANNEL_ID>/status      /s/<CHANNEL_ID>/send      ...
+//
+// El ERP no necesita saber nada de esto: guarda la URL del puente por canal,
+// y a esa URL le pega `/status`, `/send`, etc. Poniéndole
+// `https://wa.midominio.com/s/<CHANNEL_ID>` sale solo.
+//
+// Y la sesión se crea sola la primera vez que el ERP pregunta por ese canal:
+// agregar un número más es crear el canal en el ERP y escanear. Sin deploy.
+//
+// UN SOLO REPO PARA TODOS LOS CLIENTES: nada acá es de una empresa en
+// particular, todo lo que cambia son variables de entorno.
 //
 // ── Lo que el ERP le pide al puente ──────────────────────────────────────────
-//   GET  /status          -> { connection, lastQr, meNumber }
-//   GET  /contact-name    -> { ok, name }           ?to=<dígitos>
-//   POST /send            { to, toJid?, text, replyTo? }
-//   POST /send-reaction   { to, toJid?, targetId, emoji }
-//   POST /send-media      { to, toJid?, url | base64, tipo?, caption?, filename?, mimetype? }
+//   GET  /s/<id>/status          -> { connection, lastQr, meNumber }
+//   GET  /s/<id>/contact-name    -> { ok, name }           ?to=<dígitos>
+//   POST /s/<id>/send            { to, toJid?, text, replyTo? }
+//   POST /s/<id>/send-reaction   { to, toJid?, targetId, emoji }
+//   POST /s/<id>/send-media      { to, toJid?, url | base64, tipo?, caption?, ... }
+//
+// Las mismas rutas sin el prefijo `/s/<id>` siguen funcionando contra el canal
+// de CHANNEL_ID, para no romper los puentes que ya están configurados así.
 //
 // ── Lo que el puente le manda al ERP ─────────────────────────────────────────
 //   POST {ERP}/api/webhooks/baileys/inbound        cada mensaje que entra
-//   POST {ERP}/api/webhooks/baileys/inbound/media  los bytes del archivo (multipart)
+//   POST {ERP}/api/webhooks/baileys/inbound/media  los bytes del archivo
 //   POST {ERP}/api/webhooks/baileys/status         entregado / leído / falló
 //
 // Todo lleva el header `x-bridge-secret`.
 //
 // ── Por qué la media la sube el puente ───────────────────────────────────────
 // La media de WhatsApp viaja cifrada con la clave de la sesión. El ERP no
-// puede ir a buscarla después ni con la URL: solo el puente puede descifrarla.
-// Por eso la baja, la sube al ERP y recién ahí se ve en el inbox.
+// puede ir a buscarla ni teniendo la URL: solo el puente puede descifrarla.
 // =============================================================================
 
 import express from "express";
@@ -48,18 +57,18 @@ import {
 // ---------------------------------------------------------------------------
 const BRIDGE_SECRET = (process.env.BRIDGE_SECRET || "").trim();
 const EMPRESA_ID    = (process.env.EMPRESA_ID    || "").trim();
-// Se completa después de crear el canal en el ERP: sin esto el ERP no sabe a
-// qué canal pertenece el mensaje y lo rechaza.
+/** Canal por defecto, para las rutas sin `/s/<id>`. Opcional. */
 const CHANNEL_ID    = (process.env.CHANNEL_ID    || "").trim();
 const AUTH_DIR      = (process.env.AUTH_DIR      || "./auth").trim();
 const PORT          = Number(process.env.PORT || 3000);
+/** Tope de sesiones vivas. Cada una pesa, y un tope evita que un error las multiplique. */
+const MAX_SESIONES  = Math.max(1, Number(process.env.MAX_SESIONES || 10));
 
 /**
  * La base del ERP, por ejemplo https://roldanehijos.neura.com.py
  *
  * `ERP_WEBHOOK_URL` es como se llamaba antes y apuntaba directo al endpoint de
- * mensajes. Se sigue aceptando para no tener que tocar los puentes que ya están
- * andando: si viene con la ruta puesta, se le recorta y queda la base.
+ * mensajes. Se sigue aceptando: si viene con la ruta puesta, se le recorta.
  */
 const ERP_BASE = (() => {
   const directo = (process.env.ERP_BASE_URL || "").trim().replace(/\/+$/, "");
@@ -76,13 +85,12 @@ const URL_STATUS  = ERP_BASE ? `${ERP_BASE}/api/webhooks/baileys/status` : "";
  * Cómo nombrar el tipo de mensaje al ERP.
  *
  *   "baileys" (por defecto) → `imageMessage`, `conversation`… el nombre crudo.
- *   "simple"               → `image`, `text`… como lo mandaban los puentes viejos.
+ *   "simple"               → `image`, `text`… como los puentes viejos.
  *
- * Existe porque los ERP de distinta antigüedad entienden uno u otro, y un ERP
- * que no reconoce el tipo SALTEA el mensaje: el número queda vinculado, el
- * puente reenvía, el ERP contesta 200 y al inbox no entra nada. Si vas a
- * apuntar un cliente viejo a este puente, o le ponés "simple", o le enseñás a
- * su ERP a aceptar los dos (es un switch, diez líneas).
+ * Un ERP que no reconoce el tipo SALTEA el mensaje: el número queda vinculado,
+ * el puente reenvía, el ERP contesta 200 y al inbox no entra nada. Antes de
+ * apuntar un cliente viejo acá, o le ponés "simple", o le enseñás a su ERP a
+ * aceptar los dos.
  */
 const VOCAB = (process.env.KIND_VOCAB || "baileys").trim().toLowerCase() === "simple"
   ? "simple"
@@ -101,20 +109,53 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 // ---------------------------------------------------------------------------
-// Estado de la conexión
+// Sesiones
 // ---------------------------------------------------------------------------
-/** @type {{ connection: "starting"|"qr"|"open"|"close", lastQr: string|null, meNumber: string|null }} */
-const state = { connection: "starting", lastQr: null, meNumber: null };
-let sock = null;
 
 /**
- * Nombres que WhatsApp conoce (agenda del teléfono vinculado + pushName).
- * Clave: dígitos del número. Lo expone GET /contact-name para que el ERP
- * muestre el nombre real al abrir una conversación saliente.
+ * Un id de canal es un UUID y nada más.
+ *
+ * Esto no es decoración: el id arma el nombre de una carpeta en disco. Sin
+ * esta validación, un `..` en la URL escribiría fuera de AUTH_DIR.
  */
-const contactNames = new Map();
+const RE_CANAL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function rememberContactName(id, ...candidatos) {
+/** @type {Map<string, {channelId:string, state:{connection:string,lastQr:string|null,meNumber:string|null}, sock:any, contactNames:Map<string,string>, arrancando:boolean}>} */
+const sesiones = new Map();
+
+function carpetaDe(channelId) {
+  return path.join(AUTH_DIR, channelId);
+}
+
+function nuevaSesion(channelId) {
+  return {
+    channelId,
+    state: { connection: "starting", lastQr: null, meNumber: null },
+    sock: null,
+    contactNames: new Map(),
+    arrancando: false,
+  };
+}
+
+/**
+ * Devuelve la sesión de ese canal, arrancándola si hace falta.
+ *
+ * Arrancar sola es lo que hace que agregar un número no necesite un deploy:
+ * el ERP pregunta por su canal y la sesión nace ahí, pidiendo su QR.
+ */
+function obtenerSesion(channelId) {
+  let s = sesiones.get(channelId);
+  if (s) return s;
+  if (sesiones.size >= MAX_SESIONES) {
+    throw new Error(`Se alcanzó el tope de ${MAX_SESIONES} números en este puente.`);
+  }
+  s = nuevaSesion(channelId);
+  sesiones.set(channelId, s);
+  arrancar(s).catch((e) => logger.error({ channelId, err: String(e) }, "no se pudo arrancar la sesión"));
+  return s;
+}
+
+function rememberContactName(ses, id, ...candidatos) {
   const jid = String(id || "");
   // Solo números reales: un @lid no es un teléfono.
   if (!jid.endsWith("@s.whatsapp.net")) return;
@@ -123,102 +164,104 @@ function rememberContactName(id, ...candidatos) {
   const name = candidatos
     .map((n) => (typeof n === "string" ? n.trim() : ""))
     .find((n) => n && /\p{L}/u.test(n) && n.replace(/\D/g, "") !== digits);
-  if (name) contactNames.set(digits, name);
+  if (name) ses.contactNames.set(digits, name);
 }
 
-// ---------------------------------------------------------------------------
-// Socket
-// ---------------------------------------------------------------------------
-async function startSocket() {
-  const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-  logger.info({ version }, "arrancando socket baileys");
+async function arrancar(ses) {
+  if (ses.arrancando) return;
+  ses.arrancando = true;
+  const dir = carpetaDe(ses.channelId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  sock = makeWASocket({
-    version,
-    auth: authState,
-    logger,
-    browser: ["Neura ERP", "Chrome", "1.0"],
-    markOnlineOnConnect: false,
-  });
+  try {
+    const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
+    const { version } = await fetchLatestBaileysVersion();
+    logger.info({ channelId: ses.channelId, version }, "arrancando sesión");
 
-  sock.ev.on("creds.update", saveCreds);
+    const sock = makeWASocket({
+      version,
+      auth: authState,
+      logger,
+      browser: ["Neura ERP", "Chrome", "1.0"],
+      markOnlineOnConnect: false,
+    });
+    ses.sock = sock;
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      state.connection = "qr";
-      state.lastQr = qr;
-      logger.info("nuevo QR emitido");
-    }
-    if (connection === "open") {
-      state.connection = "open";
-      state.lastQr = null;
-      state.meNumber = (sock?.user?.id || "").split(":")[0].split("@")[0] || null;
-      logger.info({ me: state.meNumber }, "conectado");
-    }
-    if (connection === "close") {
-      state.connection = "close";
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      logger.warn({ code, shouldReconnect }, "conexion cerrada");
-      if (shouldReconnect) {
-        setTimeout(() => startSocket().catch((e) => logger.error(e, "reintento fallo")), 2000);
-      } else {
-        // Sesión cerrada desde el celular: hay que borrar las credenciales para
-        // que se genere un QR nuevo. Se vacía el CONTENIDO de AUTH_DIR y no el
-        // directorio: suele ser un punto de montaje y borrarlo falla, dejando
-        // credenciales viejas que loopean en 401.
-        try {
-          if (fs.existsSync(AUTH_DIR)) {
-            for (const f of fs.readdirSync(AUTH_DIR)) {
-              fs.rmSync(path.join(AUTH_DIR, f), { recursive: true, force: true });
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        ses.state.connection = "qr";
+        ses.state.lastQr = qr;
+        logger.info({ channelId: ses.channelId }, "nuevo QR emitido");
+      }
+      if (connection === "open") {
+        ses.state.connection = "open";
+        ses.state.lastQr = null;
+        ses.state.meNumber = (sock?.user?.id || "").split(":")[0].split("@")[0] || null;
+        logger.info({ channelId: ses.channelId, me: ses.state.meNumber }, "conectado");
+      }
+      if (connection === "close") {
+        ses.state.connection = "close";
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const reconectar = code !== DisconnectReason.loggedOut;
+        logger.warn({ channelId: ses.channelId, code, reconectar }, "conexión cerrada");
+        ses.arrancando = false;
+        if (!reconectar) {
+          // Sesión cerrada desde el celular: hay que borrar las credenciales
+          // para que se genere un QR nuevo. Se vacía el CONTENIDO de la
+          // carpeta y no la carpeta: puede ser un punto de montaje, y
+          // borrarla falla dejando credenciales viejas que loopean en 401.
+          try {
+            for (const f of fs.readdirSync(dir)) {
+              fs.rmSync(path.join(dir, f), { recursive: true, force: true });
             }
-          } else {
-            fs.mkdirSync(AUTH_DIR, { recursive: true });
+          } catch (e) {
+            logger.warn({ channelId: ses.channelId, err: String(e) }, "no se pudo limpiar la carpeta");
           }
-        } catch (e) {
-          logger.warn(e, "no se pudo limpiar AUTH_DIR");
+          ses.state.meNumber = null;
         }
-        state.meNumber = null;
-        setTimeout(() => startSocket().catch((e) => logger.error(e, "reinicio fallo")), 2000);
+        setTimeout(() => arrancar(ses).catch((e) => logger.error({ err: String(e) }, "reintento falló")), 2000);
       }
-    }
-  });
+    });
 
-  // Agenda del teléfono (sincronización inicial) + altas y cambios en vivo.
-  sock.ev.on("messaging-history.set", (h) => {
-    for (const c of h?.contacts ?? []) rememberContactName(c.id, c.name, c.verifiedName, c.notify);
-  });
-  sock.ev.on("contacts.upsert", (cs) => {
-    for (const c of cs ?? []) rememberContactName(c.id, c.name, c.verifiedName, c.notify);
-  });
-  sock.ev.on("contacts.update", (cs) => {
-    for (const c of cs ?? []) rememberContactName(c.id, c.name, c.verifiedName, c.notify);
-  });
+    // Agenda del teléfono + altas y cambios en vivo.
+    sock.ev.on("messaging-history.set", (h) => {
+      for (const c of h?.contacts ?? []) rememberContactName(ses, c.id, c.name, c.verifiedName, c.notify);
+    });
+    sock.ev.on("contacts.upsert", (cs) => {
+      for (const c of cs ?? []) rememberContactName(ses, c.id, c.name, c.verifiedName, c.notify);
+    });
+    sock.ev.on("contacts.update", (cs) => {
+      for (const c of cs ?? []) rememberContactName(ses, c.id, c.name, c.verifiedName, c.notify);
+    });
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-    for (const m of messages) {
-      try {
-        await handleInbound(m);
-      } catch (e) {
-        logger.error(e, "handleInbound");
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+      for (const m of messages) {
+        try {
+          await handleInbound(ses, m);
+        } catch (e) {
+          logger.error({ channelId: ses.channelId, err: String(e) }, "handleInbound");
+        }
       }
-    }
-  });
+    });
 
-  // Tildes: sin esto los mensajes mandados desde el ERP se quedan sin marcas y
-  // el que atiende cree que no llegaron.
-  sock.ev.on("messages.update", async (updates) => {
-    for (const u of updates ?? []) {
-      try {
-        await reportarEstado(u);
-      } catch (e) {
-        logger.warn(e, "reportarEstado");
+    // Tildes: sin esto el que atiende cree que el mensaje no llegó.
+    sock.ev.on("messages.update", async (updates) => {
+      for (const u of updates ?? []) {
+        try {
+          await reportarEstado(u);
+        } catch (e) {
+          logger.warn({ err: String(e) }, "reportarEstado");
+        }
       }
-    }
-  });
+    });
+  } catch (e) {
+    ses.arrancando = false;
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,17 +271,17 @@ async function startSocket() {
 /** Qué clase de mensaje es, en los dos vocabularios. */
 function clasificar(msg) {
   const tabla = [
-    ["conversation",            "text",     false],
-    ["extendedTextMessage",     "text",     false],
-    ["imageMessage",            "image",    true],
-    ["videoMessage",            "video",    true],
-    ["audioMessage",            "audio",    true],
-    ["documentMessage",         "document", true],
-    ["stickerMessage",          "sticker",  true],
-    ["locationMessage",         "location", false],
-    ["contactMessage",          "contact",  false],
-    ["contactsArrayMessage",    "contact",  false],
-    ["reactionMessage",         "reaction", false],
+    ["conversation",         "text",     false],
+    ["extendedTextMessage",  "text",     false],
+    ["imageMessage",         "image",    true],
+    ["videoMessage",         "video",    true],
+    ["audioMessage",         "audio",    true],
+    ["documentMessage",      "document", true],
+    ["stickerMessage",       "sticker",  true],
+    ["locationMessage",      "location", false],
+    ["contactMessage",       "contact",  false],
+    ["contactsArrayMessage", "contact",  false],
+    ["reactionMessage",      "reaction", false],
   ];
   for (const [clave, simple, media] of tabla) {
     if (msg[clave]) return { baileys: clave, simple, hasMedia: media };
@@ -250,7 +293,6 @@ function clasificar(msg) {
   return { baileys: "unknown", simple: "unknown", hasMedia: false };
 }
 
-/** El texto visible del mensaje, si tiene. */
 function textoDe(msg) {
   return (
     msg.conversation ||
@@ -263,7 +305,7 @@ function textoDe(msg) {
   );
 }
 
-/** El mensaje al que este responde, para que el inbox pueda mostrar el hilo. */
+/** El mensaje al que este responde, para que el inbox muestre el hilo. */
 function citadoDe(msg) {
   const ctx =
     msg.extendedTextMessage?.contextInfo ||
@@ -275,7 +317,7 @@ function citadoDe(msg) {
   return ctx?.stanzaId || null;
 }
 
-/** Tarjetas de contacto compartidas, con la forma que el inbox ya sabe dibujar. */
+/** Tarjetas de contacto compartidas, con la forma que el inbox sabe dibujar. */
 function contactosDe(msg) {
   const uno = msg.contactMessage;
   const varios = msg.contactsArrayMessage?.contacts;
@@ -285,15 +327,14 @@ function contactosDe(msg) {
   return null;
 }
 
-async function handleInbound(m) {
+async function handleInbound(ses, m) {
   // fromMe: lo mandó el mismo número desde el celular, no desde el ERP. Se
-  // reenvía igual para que aparezca en el inbox; el ERP deduplica por el id del
-  // mensaje, así que lo que salió del ERP no se duplica.
+  // reenvía igual para que aparezca en el inbox; el ERP deduplica por el id
+  // del mensaje, así que lo que salió del ERP no se duplica.
   const fromMe = m.key?.fromMe === true;
   const remoteJid = String(m.key?.remoteJid || "");
-  // Solo conversaciones 1 a 1. Grupos (@g.us) y estados se ignoran.
-  const isDirect = remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@lid");
-  if (!isDirect) return;
+  // Solo conversaciones 1 a 1: grupos (@g.us) y estados se ignoran.
+  if (!(remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@lid"))) return;
 
   // Con un @lid, el número real viene en `remoteJidAlt`; si no está, se le
   // pregunta al mapeo que Baileys mantiene.
@@ -304,22 +345,22 @@ async function handleInbound(m) {
       pnJid = alt;
     } else {
       try {
-        const mapped = await sock?.signalRepository?.lidMapping?.getPNForLID?.(remoteJid);
+        const mapped = await ses.sock?.signalRepository?.lidMapping?.getPNForLID?.(remoteJid);
         if (mapped) pnJid = String(mapped);
       } catch (e) {
-        logger.warn(e, "no se pudo resolver LID->PN");
+        logger.warn({ err: String(e) }, "no se pudo resolver LID->PN");
       }
     }
   }
 
-  // El identificador con el que el ERP guarda el contacto es el del mensaje:
+  // El contacto se guarda con el identificador con el que llega el mensaje:
   // cambiarlo por el teléfono real duplicaría conversaciones. El teléfono va
   // aparte, en fromPhone, solo para mostrar.
   const fromDigits = remoteJid.split("@")[0].split(":")[0].replace(/\D/g, "");
   const fromPhone = pnJid.split("@")[0].split(":")[0].replace(/\D/g, "");
   if (!fromDigits) return;
 
-  if (!fromMe && m.pushName) rememberContactName(pnJid, m.pushName);
+  if (!fromMe && m.pushName) rememberContactName(ses, pnJid, m.pushName);
 
   const msg = m.message || {};
   const clase = clasificar(msg);
@@ -327,7 +368,7 @@ async function handleInbound(m) {
   if (!waMessageId) return;
 
   const payload = {
-    channelId: CHANNEL_ID || null,
+    channelId: ses.channelId,
     empresaId: EMPRESA_ID || null,
     fromDigits,
     fromPhone: fromPhone && fromPhone !== fromDigits ? fromPhone : undefined,
@@ -343,8 +384,6 @@ async function handleInbound(m) {
     timestamp: new Date((Number(m.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000).toISOString(),
   };
 
-  if (!payload.channelId) logger.warn("CHANNEL_ID sin configurar: el ERP no va a poder rutear");
-
   let aceptado = false;
   try {
     const res = await fetch(URL_INBOUND, {
@@ -354,29 +393,37 @@ async function handleInbound(m) {
     });
     aceptado = res.ok;
     if (!res.ok) {
-      logger.warn({ status: res.status, body: await res.text().catch(() => "") }, "el ERP rechazó el mensaje");
+      logger.warn(
+        { channelId: ses.channelId, status: res.status, body: await res.text().catch(() => "") },
+        "el ERP rechazó el mensaje"
+      );
     } else {
-      logger.info({ fromDigits, kind: payload.messageKind }, "mensaje reenviado al ERP");
+      logger.info({ channelId: ses.channelId, fromDigits, kind: payload.messageKind }, "mensaje reenviado");
     }
   } catch (e) {
-    logger.error(e, "no se pudo avisar al ERP");
+    logger.error({ channelId: ses.channelId, err: String(e) }, "no se pudo avisar al ERP");
     return;
   }
 
   // Los bytes van después y solo si el mensaje quedó guardado: subirlos para
   // una fila que no existe deja el archivo colgado.
   if (aceptado && clase.hasMedia) {
-    subirMedia(m, waMessageId, clase.simple).catch((e) => logger.warn(e, "subirMedia"));
+    subirMedia(ses, m, waMessageId, clase.simple).catch((e) =>
+      logger.warn({ err: String(e) }, "subirMedia")
+    );
   }
 }
 
 /** Baja el archivo de WhatsApp y lo sube al ERP. */
-async function subirMedia(m, waMessageId, tipo) {
+async function subirMedia(ses, m, waMessageId, tipo) {
   let buffer;
   try {
-    buffer = await downloadMediaMessage(m, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+    buffer = await downloadMediaMessage(m, "buffer", {}, {
+      logger,
+      reuploadRequest: ses.sock.updateMediaMessage,
+    });
   } catch (e) {
-    logger.warn(e, "no se pudo bajar la media de WhatsApp");
+    logger.warn({ err: String(e) }, "no se pudo bajar la media de WhatsApp");
     return;
   }
   if (!buffer?.length) return;
@@ -393,7 +440,7 @@ async function subirMedia(m, waMessageId, tipo) {
   const filename = doc?.fileName || `${waMessageId}`;
 
   const form = new FormData();
-  form.append("channelId", CHANNEL_ID);
+  form.append("channelId", ses.channelId);
   form.append("empresaId", EMPRESA_ID);
   form.append("waMessageId", waMessageId);
   form.append("tipo", tipo);
@@ -415,7 +462,7 @@ async function subirMedia(m, waMessageId, tipo) {
 async function reportarEstado(u) {
   const waMessageId = u?.key?.id;
   if (!waMessageId || u?.key?.fromMe !== true) return;
-  // 2 = entregado al servidor, 3 = entregado al celular, 4 = leído, 0/1 = en curso.
+  // 2 = entregado al servidor, 3 = al celular, 4 = leído, 0/1 = en curso.
   const n = Number(u?.update?.status);
   const status = n >= 4 ? "read" : n === 3 ? "delivered" : n === 2 ? "sent" : null;
   if (!status) return;
@@ -437,8 +484,7 @@ async function reportarEstado(u) {
 // HTTP
 // ---------------------------------------------------------------------------
 const app = express();
-// 15mb alcanza para una factura en PDF mandada como base64. El límite real de
-// WhatsApp es mayor, pero por acá no pasa nada tan grande en el día a día.
+// 15mb alcanza para una factura en PDF mandada como base64.
 app.use(express.json({ limit: "15mb" }));
 
 function requireSecret(req, res, next) {
@@ -446,6 +492,38 @@ function requireSecret(req, res, next) {
     return res.status(401).json({ ok: false, error: "bad secret" });
   }
   next();
+}
+
+/**
+ * Resuelve de qué número habla este pedido.
+ *
+ * Con `/s/<id>/...` es ese canal. Sin prefijo, es el de CHANNEL_ID, que está
+ * para no romper los puentes configurados antes de que esto soportara varios.
+ */
+function sesionDe(req, res) {
+  const id = String(req.params.channelId || CHANNEL_ID || "").trim();
+  if (!id) {
+    res.status(400).json({ ok: false, error: "falta el canal: usá /s/<CHANNEL_ID>/..." });
+    return null;
+  }
+  if (!RE_CANAL.test(id)) {
+    res.status(400).json({ ok: false, error: "el canal tiene que ser un UUID" });
+    return null;
+  }
+  try {
+    return obtenerSesion(id);
+  } catch (e) {
+    res.status(503).json({ ok: false, error: e?.message || "no se pudo abrir la sesión" });
+    return null;
+  }
+}
+
+function exigirConexion(ses, res) {
+  if (ses.state.connection !== "open" || !ses.sock) {
+    res.status(503).json({ ok: false, error: "socket no conectado" });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -465,73 +543,74 @@ function destino(body) {
   return to.length > 13 ? `${to}@lid` : `${to}@s.whatsapp.net`;
 }
 
-function exigirConexion(res) {
-  if (state.connection !== "open" || !sock) {
-    res.status(503).json({ ok: false, error: "socket no conectado" });
-    return false;
-  }
-  return true;
-}
+// ── Los handlers, una vez, montados en las dos formas de ruta ───────────────
 
-app.get("/status", requireSecret, (_req, res) => {
+const hStatus = (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
   res.json({
-    connection: state.connection,
-    lastQr: state.lastQr,
-    meNumber: state.meNumber,
+    connection: ses.state.connection,
+    lastQr: ses.state.lastQr,
+    meNumber: ses.state.meNumber,
   });
-});
+};
 
-// El nombre que WhatsApp conoce de un número. null si no lo conoce (número no
-// agendado que todavía no escribió).
-app.get("/contact-name", requireSecret, (req, res) => {
+const hContactName = (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
   const to = String(req.query?.to || "").replace(/\D/g, "");
-  res.json({ ok: true, name: (to && contactNames.get(to)) || null });
-});
+  res.json({ ok: true, name: (to && ses.contactNames.get(to)) || null });
+};
 
-app.post("/send", requireSecret, async (req, res) => {
+const hSend = async (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
   const jid = destino(req.body);
   const text = String(req.body?.text || "");
   const replyTo = String(req.body?.replyTo || "").trim();
   if (!jid || !text) return res.status(400).json({ ok: false, error: "to y text requeridos" });
-  if (!exigirConexion(res)) return;
+  if (!exigirConexion(ses, res)) return;
   try {
-    // Contestar citando: sin esto, una respuesta sale como mensaje suelto y el
-    // cliente no ve a qué se le contestó.
+    // Contestar citando: sin esto una respuesta sale suelta y el cliente no
+    // ve a qué se le contestó.
     const opciones = replyTo
       ? { quoted: { key: { remoteJid: jid, id: replyTo, fromMe: false }, message: {} } }
       : undefined;
-    const sent = await sock.sendMessage(jid, { text }, opciones);
+    const sent = await ses.sock.sendMessage(jid, { text }, opciones);
     res.json({ ok: true, id: sent?.key?.id || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-});
+};
 
-app.post("/send-reaction", requireSecret, async (req, res) => {
+const hReaction = async (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
   const jid = destino(req.body);
   const targetId = String(req.body?.targetId || "").trim();
   // Un emoji vacío quita la reacción, igual que en WhatsApp.
   const emoji = req.body?.emoji == null ? "" : String(req.body.emoji);
   if (!jid || !targetId) return res.status(400).json({ ok: false, error: "to y targetId requeridos" });
-  if (!exigirConexion(res)) return;
+  if (!exigirConexion(ses, res)) return;
   try {
-    const sent = await sock.sendMessage(jid, {
+    const sent = await ses.sock.sendMessage(jid, {
       react: { text: emoji, key: { remoteJid: jid, id: targetId, fromMe: false } },
     });
     res.json({ ok: true, id: sent?.key?.id || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-});
+};
 
 /**
  * Manda un archivo.
  *
- * Acepta `url` (el ERP ya lo tiene subido en su storage y pasa el link, que es
- * lo barato: no viajan megabytes por el cuerpo del pedido) o `base64` para los
- * ERP viejos que mandaban el binario.
+ * Acepta `url` (el ERP ya lo tiene en su storage y pasa el link, que es lo
+ * barato) o `base64` para los ERP viejos que mandaban el binario.
  */
-app.post("/send-media", requireSecret, async (req, res) => {
+const hMedia = async (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
   const jid = destino(req.body);
   const url = String(req.body?.url || "").trim();
   const b64 = String(req.body?.base64 || "");
@@ -541,7 +620,7 @@ app.post("/send-media", requireSecret, async (req, res) => {
   const tipo = String(req.body?.tipo || "").trim().toLowerCase();
   if (!jid) return res.status(400).json({ ok: false, error: "to requerido" });
   if (!url && !b64) return res.status(400).json({ ok: false, error: "url o base64 requerido" });
-  if (!exigirConexion(res)) return;
+  if (!exigirConexion(ses, res)) return;
 
   let buffer;
   try {
@@ -559,7 +638,6 @@ app.post("/send-media", requireSecret, async (req, res) => {
   }
   if (!mimetype) mimetype = "application/octet-stream";
 
-  // El tipo que pide el ERP manda; si no vino, se deduce del mimetype.
   const clase =
     tipo ||
     (mimetype.startsWith("image/")
@@ -580,43 +658,141 @@ app.post("/send-media", requireSecret, async (req, res) => {
     else if (clase === "sticker") contenido = { sticker: buffer };
     else contenido = { document: buffer, mimetype, fileName: filename || "documento", caption };
 
-    const sent = await sock.sendMessage(jid, contenido);
+    const sent = await ses.sock.sendMessage(jid, contenido);
     res.json({ ok: true, id: sent?.key?.id || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-});
+};
 
-// Pantalla mínima para escanear el QR desde el celular, sin pasar por el ERP.
-app.get("/", async (_req, res) => {
+// Pantalla para escanear el QR desde el celular, sin pasar por el ERP.
+const hQrPage = async (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
+  const st = ses.state;
   let body = "";
-  if (state.connection === "open") {
-    body = `<h1 style="color:#2a7">Conectado</h1><p>Número: ${state.meNumber || "-"}</p>`;
-  } else if (state.connection === "qr" && state.lastQr) {
-    const dataUrl = await QRCode.toDataURL(state.lastQr);
+  if (st.connection === "open") {
+    body = `<h1 style="color:#2a7">Conectado</h1><p>Número: ${st.meNumber || "-"}</p>`;
+  } else if (st.connection === "qr" && st.lastQr) {
+    const dataUrl = await QRCode.toDataURL(st.lastQr);
     body = `<h1>Escaneá con WhatsApp</h1><img src="${dataUrl}" style="max-width:320px" />
       <p>WhatsApp → Dispositivos vinculados → Vincular un dispositivo</p>`;
   } else {
-    body = `<h1>Estado: ${state.connection}</h1><p>Recargá en unos segundos…</p>`;
+    body = `<h1>Estado: ${st.connection}</h1><p>Recargá en unos segundos…</p>`;
   }
   res.send(`<!doctype html><meta charset="utf-8"><title>Puente WhatsApp</title>
     <body style="font-family:system-ui;max-width:520px;margin:40px auto;padding:0 16px">${body}
     <script>setTimeout(()=>location.reload(), 4000)</script></body>`);
-});
+};
 
-app.get("/qr.png", async (_req, res) => {
-  if (state.connection !== "qr" || !state.lastQr) return res.status(404).send("sin QR");
-  const buf = await QRCode.toBuffer(state.lastQr);
+const hQrPng = async (req, res) => {
+  const ses = sesionDe(req, res);
+  if (!ses) return;
+  if (ses.state.connection !== "qr" || !ses.state.lastQr) return res.status(404).send("sin QR");
+  const buf = await QRCode.toBuffer(ses.state.lastQr);
   res.setHeader("content-type", "image/png");
   res.send(buf);
+};
+
+// Por número.
+app.get("/s/:channelId/status", requireSecret, hStatus);
+app.get("/s/:channelId/contact-name", requireSecret, hContactName);
+app.post("/s/:channelId/send", requireSecret, hSend);
+app.post("/s/:channelId/send-reaction", requireSecret, hReaction);
+app.post("/s/:channelId/send-media", requireSecret, hMedia);
+app.get("/s/:channelId/qr.png", hQrPng);
+app.get("/s/:channelId", hQrPage);
+app.get("/s/:channelId/", hQrPage);
+
+// Sin prefijo: el canal de CHANNEL_ID. Para los puentes de un solo número que
+// ya estaban configurados así.
+app.get("/status", requireSecret, hStatus);
+app.get("/contact-name", requireSecret, hContactName);
+app.post("/send", requireSecret, hSend);
+app.post("/send-reaction", requireSecret, hReaction);
+app.post("/send-media", requireSecret, hMedia);
+app.get("/qr.png", hQrPng);
+
+app.get("/health", (_req, res) => {
+  const numeros = [...sesiones.values()].map((s) => ({
+    channelId: s.channelId,
+    connection: s.state.connection,
+    meNumber: s.state.meNumber,
+  }));
+  res.json({ ok: true, sesiones: numeros.length, numeros });
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, connection: state.connection }));
+// La portada: si hay un solo número configurado, su QR; si no, la lista.
+app.get("/", async (req, res) => {
+  if (CHANNEL_ID && sesiones.size <= 1) {
+    req.params.channelId = CHANNEL_ID;
+    return hQrPage(req, res);
+  }
+  const filas = [...sesiones.values()]
+    .map((s) => {
+      const estado = s.state.connection === "open" ? `Conectado · ${s.state.meNumber || "-"}` : s.state.connection;
+      return `<li><a href="/s/${s.channelId}">${s.channelId}</a> — ${estado}</li>`;
+    })
+    .join("");
+  res.send(`<!doctype html><meta charset="utf-8"><title>Puente WhatsApp</title>
+    <body style="font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px">
+    <h1>Puente WhatsApp</h1>
+    <p>${sesiones.size} número(s). Para vincular uno nuevo, abrí <code>/s/&lt;CHANNEL_ID&gt;</code>.</p>
+    <ul>${filas || "<li>Todavía no hay ninguno.</li>"}</ul>
+    <script>setTimeout(()=>location.reload(), 6000)</script></body>`);
+});
 
 app.listen(PORT, () =>
-  logger.info({ port: PORT, authDir: path.resolve(AUTH_DIR), erp: ERP_BASE, vocab: VOCAB }, "puente escuchando")
+  logger.info(
+    { port: PORT, authDir: path.resolve(AUTH_DIR), erp: ERP_BASE, vocab: VOCAB, maxSesiones: MAX_SESIONES },
+    "puente escuchando"
+  )
 );
-startSocket().catch((e) => {
-  logger.error(e, "startSocket falló");
-  process.exit(1);
-});
+
+/**
+ * Mudanza del formato viejo.
+ *
+ * Los puentes de un solo número guardaban la sesión directamente en AUTH_DIR.
+ * Acá cada número tiene su carpeta. Si encontramos credenciales sueltas en la
+ * raíz y sabemos a qué canal son, se mudan adentro: así el número que ya
+ * estaba vinculado sigue vinculado y nadie tiene que volver a escanear.
+ *
+ * Corre una sola vez: después de mudar, la raíz ya no tiene creds.json.
+ */
+function migrarSesionVieja() {
+  if (!CHANNEL_ID || !RE_CANAL.test(CHANNEL_ID)) return;
+  const credsRaiz = path.join(AUTH_DIR, "creds.json");
+  if (!fs.existsSync(credsRaiz)) return;
+
+  const destinoDir = carpetaDe(CHANNEL_ID);
+  if (fs.existsSync(path.join(destinoDir, "creds.json"))) {
+    logger.warn("hay credenciales en la raíz y en la carpeta del canal: se dejan como están");
+    return;
+  }
+  try {
+    fs.mkdirSync(destinoDir, { recursive: true });
+    let movidos = 0;
+    for (const f of fs.readdirSync(AUTH_DIR)) {
+      const origen = path.join(AUTH_DIR, f);
+      // Las carpetas de canales ya están en el formato nuevo.
+      if (fs.statSync(origen).isDirectory()) continue;
+      fs.renameSync(origen, path.join(destinoDir, f));
+      movidos++;
+    }
+    logger.info({ channelId: CHANNEL_ID, archivos: movidos }, "sesión mudada al formato nuevo");
+  } catch (e) {
+    logger.error({ err: String(e) }, "no se pudo mudar la sesión vieja; puede hacer falta escanear de nuevo");
+  }
+}
+
+migrarSesionVieja();
+
+// El canal por defecto arranca solo, para que el QR esté listo sin esperar a
+// que el ERP pregunte.
+if (CHANNEL_ID && RE_CANAL.test(CHANNEL_ID)) {
+  try {
+    obtenerSesion(CHANNEL_ID);
+  } catch (e) {
+    logger.error({ err: String(e) }, "no se pudo arrancar el canal por defecto");
+  }
+}
