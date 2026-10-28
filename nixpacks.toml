@@ -1,0 +1,9 @@
+# Configuracion Nixpacks: forzamos node 20 y no ejecutamos build (no hay build step).
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm ci --omit=optional"]
+
+[start]
+cmd = "node server.mjs"

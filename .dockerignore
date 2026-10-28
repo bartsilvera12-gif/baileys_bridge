@@ -1,0 +1,5 @@
+node_modules
+auth
+.git
+.env*
+npm-debug.log
